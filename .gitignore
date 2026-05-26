@@ -1,0 +1,72 @@
+# ==============================================================================
+# OLLAMA-WRAPPER GITIGNORE PROFILE
+# ==============================================================================
+
+# Local Vector Storage Vaults (Never commit local database binary footprints)
+local_vector_db/
+research_vault/
+tmp_test_vault/
+*.npy
+manifest.json
+test/
+pkg/
+
+# Byte-compiled / optimized / Sphinx architectures
+__pycache__/
+*.py[cod]
+*$py.class
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+
+# C extensions
+*.so
+
+# Distribution / packaging
+bin/
+build/
+develop-eggs/
+dist/
+downloads/
+eggs/
+.eggs/
+lib/
+lib64/
+parts/
+sdist/
+var/
+wheels/
+share/python-wheels/
+*.egg-info/
+.installed.cfg
+*.egg
+MANIFEST
+
+# Virtual Environments (Isolate heavy third-party framework code directories)
+.env
+.venv
+env/
+venv/
+ENV/
+env.bak/
+venv.bak/
+
+# User-specific configuration files & secrets
+.idea/
+.vscode/
+*.suo
+*.ntvs*
+*.njsproj
+*.sln
+*.swp
+.DS_Store
+.env.local
+.env.development
+.env.production
+
+# Heavy Data Ingestion Pipelines & Logs
+data/
+*.log
+*.csv
+*.json
+*.md.bak

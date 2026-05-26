@@ -25,7 +25,7 @@ Most local RAG setups fall off a performance cliff on consumer hardware because 
 ## 📁 Repository Structure
 
 ```text
-ollama-wrapper-rag/
+ollama-wrapper/
 ├── src/
 │   └── ollama_wrapper/
 │       ├── __init__.py      # Exposes the main Singleton Wrapper
@@ -39,8 +39,8 @@ ollama-wrapper-rag/
 Ensure you have Ollama installed and running locally on your machine.
 1. Clone & Install Dependencies
 ```
-git clone [https://github.com/yourusername/ollama-wrapper-rag.git](https://github.com/yourusername/ollama-wrapper-rag.git)
-cd ollama-wrapper-rag
+git clone [https://github.com/akjjha635/ollama-wrapper.git](https://github.com/akjjha635/ollama-wrapper.git)
+cd ollama-wrapper
 pip install numpy pydantic ollama
 ```
 2. Pull Required Model Weights
@@ -58,7 +58,7 @@ This single script demonstrates document ingestion with semantic topic-splitting
 import asyncio
 from pydantic import BaseModel, Field
 from typing import List
-from ollama_wrapper import OllamaWrapper
+from ollama-wrapper import OllamaWrapper
 
 # 1. Define your target structured output schema
 class TechnicalExtraction(BaseModel):

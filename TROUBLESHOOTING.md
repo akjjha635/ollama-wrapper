@@ -227,7 +227,7 @@ for source in sources:
 import logging
 
 logging.basicConfig(level=logging.DEBUG)
-logger = logging.getLogger("ollama_wrapper")
+logger = logging.getLogger("ollama-wrapper")
 
 wrapper = OllamaWrapper()
 # Now you'll see detailed logs (once logging is integrated)
@@ -235,7 +235,7 @@ wrapper = OllamaWrapper()
 
 ### Inspect retrieval behavior
 ```python
-from ollama_wrapper import OllamaWrapper
+from ollama-wrapper import OllamaWrapper
 
 wrapper = OllamaWrapper(connection_type="sync")
 wrapper.ingest_knowledge_document("Document A about topic X.")

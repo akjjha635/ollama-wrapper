@@ -3,7 +3,7 @@ import asyncio
 import shutil
 import os
 from pydantic import BaseModel, Field
-from src.ollama_wrapper.core import OllamaWrapper
+from ollama_wrapper.core import OllamaWrapper
 
 # Test Pydantic Target Schema Guardrail
 class MockExtractionSchema(BaseModel):

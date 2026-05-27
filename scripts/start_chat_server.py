@@ -81,6 +81,12 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--db-storage-path", default="./local_vector_db")
     parser.add_argument("--max-active-turns", type=int, default=4)
     parser.add_argument(
+        "--retrieval-backend",
+        choices=["linear", "faiss"],
+        default="linear",
+        help="Dense retrieval backend for core retriever path.",
+    )
+    parser.add_argument(
         "--dummy-wrapper",
         action="store_true",
         help="Run with a local dummy echo backend (no Ollama required).",
@@ -101,6 +107,7 @@ async def run_server(args: argparse.Namespace) -> None:
             embed_model=args.embed_model,
             db_storage_path=args.db_storage_path,
             max_active_turns=args.max_active_turns,
+            retrieval_backend=args.retrieval_backend,
         )
 
     await wrapper.start_api_server(host=args.host, port=args.port)

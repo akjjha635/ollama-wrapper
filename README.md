@@ -2,7 +2,7 @@
 
 An ultra-lightweight local RAG (Retrieval-Augmented Generation) framework and memory management engine with a minimal Python dependency footprint, optimized explicitly for consumer-grade hardware (like NVIDIA RTX 2060 6GB). 
 
-Built entirely as a Python Singleton, this library replaces heavy enterprise framework overhead (LangChain, LlamaIndex) and external vector database infrastructure with raw, C-accelerated NumPy matrix math, smart contextual pruning, and local multi-file persistence.
+Built as a lightweight instance-based Python engine, this library replaces heavy enterprise framework overhead (LangChain, LlamaIndex) and external vector database infrastructure with raw, C-accelerated NumPy matrix math, smart contextual pruning, and local multi-file persistence.
 
 ---
 
@@ -28,7 +28,7 @@ Most local RAG setups fall off a performance cliff on consumer hardware because 
 ollama-wrapper/
 ├── src/
 │   └── ollama_wrapper/
-│       ├── __init__.py      # Exposes the main Singleton Wrapper
+│       ├── __init__.py      # Exposes the main Wrapper class
 │       └── core.py          # Complete optimized core engine class
 ├── tests/
 │   └── test_core.py         # Concurrent async and sync verification tests
@@ -91,7 +91,7 @@ class TechnicalExtraction(BaseModel):
     confidence_rating: float = Field(description="Calculated extraction metric between 0.0 and 1.0.")
 
 async def main():
-    # 2. Instantiate the Singleton Wrapper (Optimized for 6GB VRAM)
+    # 2. Instantiate a Wrapper instance (Optimized for 6GB VRAM)
     ai_system = OllamaWrapper(
         connection_type="sync",
         llm_model="deepseek-r1:1.5b",
@@ -134,5 +134,51 @@ if __name__ == "__main__":
     asyncio.run(main())
 ```
 
+Lifecycle note: each `OllamaWrapper(...)` call creates an independent instance. If you started the API server on an instance, call `close(stop_server=True)` during teardown.
+
 ## 🛡️ License
 Distributed under the MIT License. See `LICENSE` for more information.
+
+## Project Roadmap
+
+See [ROADMAP.md](ROADMAP.md) for the v0.2 layered architecture plan, migration phases, and success metrics.
+
+## Benchmark Runner
+
+After starting the chat server, run a quick latency/token benchmark:
+
+```bash
+python scripts/run_benchmark.py --base-url http://127.0.0.1:8000 --iterations 20 --message "hello"
+```
+
+Optional: include message options and save the JSON report.
+
+```bash
+python scripts/run_benchmark.py --base-url http://127.0.0.1:8000 --iterations 20 --options-json '{"budget_mode":"warn"}' --output benchmark_report.json
+```
+
+Comparative benchmark mode (for example, linear vs faiss):
+
+```bash
+# Terminal 1
+python scripts/start_chat_server.py --port 8000 --retrieval-backend linear
+
+# Terminal 2
+python scripts/start_chat_server.py --port 8001 --retrieval-backend faiss
+
+# Terminal 3
+python scripts/run_benchmark.py --compare --base-url http://127.0.0.1:8000 --candidate-base-url http://127.0.0.1:8001 --baseline-label linear --candidate-label faiss --iterations 20
+```
+
+Generate a markdown release-note table from comparison JSON:
+
+```bash
+python scripts/run_benchmark.py --compare --base-url http://127.0.0.1:8000 --candidate-base-url http://127.0.0.1:8001 --output comparison.json
+python scripts/benchmark_report_to_markdown.py --input comparison.json --output benchmark_summary.md
+```
+
+Run retrieval quality regression gates from a JSON dataset:
+
+```bash
+python scripts/run_quality_regression.py --dataset data/quality_samples.json --min-query-hit 0.40 --min-groundedness 0.50 --min-coverage 0.05
+```

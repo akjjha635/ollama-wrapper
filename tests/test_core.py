@@ -3,6 +3,7 @@ import asyncio
 import shutil
 import os
 from pydantic import BaseModel, Field
+from ollama_wrapper.control import SQLiteRateLimiter
 from ollama_wrapper.core import OllamaWrapper
 
 # Test Pydantic Target Schema Guardrail
@@ -13,8 +14,7 @@ class MockExtractionSchema(BaseModel):
 class TestOllamaWrapperHardening(unittest.TestCase):
 
     def setUp(self):
-        """Tears down the instance state tracking cache before running clean test slices."""
-        OllamaWrapper.reset_singleton()
+        """Prepare isolated filesystem state for each test."""
         self.test_db_dir = "./tmp_test_vault"
         
     def tearDown(self):
@@ -22,14 +22,14 @@ class TestOllamaWrapperHardening(unittest.TestCase):
         if os.path.exists(self.test_db_dir):
             shutil.rmtree(self.test_db_dir)
 
-    def test_singleton_enforcement(self):
-        """Ensures that changing parameters in a separate call target maps to the same active reference."""
+    def test_instances_are_independent(self):
+        """Ensures each constructor call creates an independent instance."""
         instance_1 = OllamaWrapper(connection_type="sync", llm_model="deepseek-r1:1.5b")
         instance_2 = OllamaWrapper(connection_type="async", llm_model="different-model:latest")
-        
-        # FIXED BUG: Changed invalid 'setIs' to standard 'assertIs' identity check
-        self.assertIs(instance_1, instance_2)
-        self.assertEqual(instance_2.connection_type, "sync")  # Retains first instantiation configurations
+
+        self.assertIsNot(instance_1, instance_2)
+        self.assertEqual(instance_1.connection_type, "sync")
+        self.assertEqual(instance_2.connection_type, "async")
 
     def test_validation_invalid_connection_type(self):
         """Guarantees the driver throws clean parameter errors on invalid configuration strings."""
@@ -93,10 +93,83 @@ class TestOllamaWrapperHardening(unittest.TestCase):
         self.assertTrue(hasattr(result, 'extracted_topic'))
         self.assertIsInstance(result.numeric_parameter, int)
 
-class TestOllamaWrapperAsyncConcurrences(unittest.IsolatedAsyncioTestCase):
+    def test_choose_sqlite_rate_limiter_with_filename_only_path(self):
+        wrapper = OllamaWrapper(connection_type="sync", db_storage_path=self.test_db_dir)
+        prev_backend = os.environ.get("OLLAMA_WRAPPER_RATE_LIMIT_BACKEND")
+        prev_db = os.environ.get("OLLAMA_WRAPPER_RATE_LIMIT_DB")
+        db_file = "tmp_rate_limit_core_test.sqlite3"
+        try:
+            os.environ["OLLAMA_WRAPPER_RATE_LIMIT_BACKEND"] = "sqlite"
+            os.environ["OLLAMA_WRAPPER_RATE_LIMIT_DB"] = db_file
+            limiter = wrapper._choose_rate_limiter()
+            self.assertIsInstance(limiter, SQLiteRateLimiter)
+        finally:
+            if prev_backend is None:
+                os.environ.pop("OLLAMA_WRAPPER_RATE_LIMIT_BACKEND", None)
+            else:
+                os.environ["OLLAMA_WRAPPER_RATE_LIMIT_BACKEND"] = prev_backend
+            if prev_db is None:
+                os.environ.pop("OLLAMA_WRAPPER_RATE_LIMIT_DB", None)
+            else:
+                os.environ["OLLAMA_WRAPPER_RATE_LIMIT_DB"] = prev_db
+            if os.path.exists(db_file):
+                os.remove(db_file)
 
-    def setUp(self):
-        OllamaWrapper.reset_singleton()
+    def test_invalid_rate_limit_env_values_fall_back_to_defaults(self):
+        wrapper = OllamaWrapper(connection_type="sync", db_storage_path=self.test_db_dir)
+        prev_qps = os.environ.get("OLLAMA_WRAPPER_RATE_LIMIT_QPS")
+        prev_burst = os.environ.get("OLLAMA_WRAPPER_RATE_LIMIT_BURST")
+        prev_backend = os.environ.get("OLLAMA_WRAPPER_RATE_LIMIT_BACKEND")
+        try:
+            os.environ["OLLAMA_WRAPPER_RATE_LIMIT_BACKEND"] = "memory"
+            os.environ["OLLAMA_WRAPPER_RATE_LIMIT_QPS"] = "not-a-float"
+            os.environ["OLLAMA_WRAPPER_RATE_LIMIT_BURST"] = "not-an-int"
+            limiter = wrapper._choose_rate_limiter()
+            self.assertEqual(limiter.default_qps, 0.0)
+            self.assertEqual(limiter.default_burst, 0)
+        finally:
+            if prev_qps is None:
+                os.environ.pop("OLLAMA_WRAPPER_RATE_LIMIT_QPS", None)
+            else:
+                os.environ["OLLAMA_WRAPPER_RATE_LIMIT_QPS"] = prev_qps
+            if prev_burst is None:
+                os.environ.pop("OLLAMA_WRAPPER_RATE_LIMIT_BURST", None)
+            else:
+                os.environ["OLLAMA_WRAPPER_RATE_LIMIT_BURST"] = prev_burst
+            if prev_backend is None:
+                os.environ.pop("OLLAMA_WRAPPER_RATE_LIMIT_BACKEND", None)
+            else:
+                os.environ["OLLAMA_WRAPPER_RATE_LIMIT_BACKEND"] = prev_backend
+
+    def test_close_stop_server_runs_teardown(self):
+        class _DummyInstance:
+            def __init__(self):
+                self._api_server_task = object()
+                self.stopped = False
+
+            async def stop_api_server(self):
+                self.stopped = True
+                self._api_server_task = None
+
+        dummy = _DummyInstance()
+        OllamaWrapper.close(dummy, stop_server=True)
+        self.assertTrue(dummy.stopped)
+        self.assertIsNone(dummy._api_server_task)
+
+    def test_unexpected_orchestrator_error_is_not_silently_swallowed(self):
+        wrapper = OllamaWrapper(connection_type="sync", auto_ensure_ollama=False)
+        wrapper.use_orchestrator_for_queries = True
+
+        class _ExplodingOrchestrator:
+            def run_query(self, request):
+                _ = request
+                raise TypeError("unexpected")
+
+        wrapper._query_orchestrator = _ExplodingOrchestrator()
+        with self.assertRaises(TypeError):
+            wrapper.ask("hello")
+
+class TestOllamaWrapperAsyncConcurrences(unittest.IsolatedAsyncioTestCase):
 
     async def test_concurrent_async_history_race_conditions(self):
         """

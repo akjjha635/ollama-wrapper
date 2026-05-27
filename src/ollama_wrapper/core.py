@@ -3,7 +3,7 @@ import time
 import json
 import subprocess
 import asyncio
-import math
+import threading
 import re
 import numpy as np
 from typing import List, Dict, Any, Type, Optional
@@ -12,6 +12,11 @@ import logging
 import ollama
 from ollama import Client, AsyncClient, ResponseError, RequestError
 from .api_server import ChatSessionManager, create_app
+from .control import GovernanceConfig, GovernancePolicy, InMemoryRateLimiter, SQLiteRateLimiter, TokenBudgetPolicy
+from .llm import OllamaProvider
+from .optimization import MathematicalOptimizationLayer
+from .orchestration import DefaultQueryOrchestrator, HeuristicRoutingPolicy, QueryRequest
+from .retrieval import HybridRetriever
 import uvicorn
 
 logger = logging.getLogger(__name__)
@@ -19,71 +24,116 @@ logger.addHandler(logging.NullHandler())
 
 
 class OllamaWrapper:
-    _instance = None
+    def __init__(self, *args, **kwargs):
+        if args:
+            logger.warning("Ignoring positional constructor args for OllamaWrapper; use keyword arguments.")
 
-    def __new__(cls, *args, **kwargs):
-        if cls._instance is None:
-            logger.info("Initializing OllamaWrapper singleton instance")
-            cls._instance = super().__new__(cls)
-            
-            # 1. Endpoint & Connection Modes
-            ip = kwargs.get("ip", "localhost")
-            port = kwargs.get("port", 11434)
-            cls._instance.api_endpoint = f"http://{ip}:{port}"
-            cls._instance.connection_type = str(kwargs.get("connection_type", "sync")).lower()
-            
-            if cls._instance.connection_type not in ["sync", "async"]:
-                raise ValueError("connection_type must be explicitly set to either 'sync' or 'async'.")
-            
-            # 2. Re-use Backend Drivers
-            cls._instance._sync_client = Client(host=cls._instance.api_endpoint)
-            cls._instance._async_client = AsyncClient(host=cls._instance.api_endpoint)
-            cls._instance.client = (
-                cls._instance._async_client if cls._instance.connection_type == "async" 
-                else cls._instance._sync_client
-            )
-            
-            # 3. Model Properties
-            cls._instance.llm_model = kwargs.get("llm_model", "deepseek-r1:1.5b")
-            cls._instance.embed_model = kwargs.get("embed_model", "nomic-embed-text")
-            
-            # 4. Context States & Thread Safe Architecture Locks
-            cls._instance.initial_context = ""
-            cls._instance.running_summary = ""
-            cls._instance.chat_history = []
-            
-            cls._instance.max_active_turns = int(kwargs.get("max_active_turns", 4))
-            if cls._instance.max_active_turns < 2:
-                raise ValueError("max_active_turns must be at least 2 to sustain a conversational turn summary block.")
-                
-            cls._instance.async_lock = asyncio.Lock()
-            
-            # 5. Local Vector Database Records
-            cls._instance.vector_database = []  # Explicit representation: [{"text": str, "vector": np.ndarray, "metadata": dict}]
-            cls._instance.db_storage_path = kwargs.get("db_storage_path", "./local_vector_db")
-            
-            # BM25 Core Stats
-            cls._instance.doc_lens = []
-            cls._instance.avg_doc_len = 0.0
-            cls._instance.df = {}
-            cls._instance.k1 = float(kwargs.get("k1", 1.5))
-            cls._instance.b = float(kwargs.get("b", 0.75))
+        logger.info("Initializing OllamaWrapper instance")
 
+        # 1. Endpoint & Connection Modes
+        ip = kwargs.get("ip", "localhost")
+        port = kwargs.get("port", 11434)
+        self.api_endpoint = f"http://{ip}:{port}"
+        self.connection_type = str(kwargs.get("connection_type", "sync")).lower()
+
+        if self.connection_type not in ["sync", "async"]:
+            raise ValueError("connection_type must be explicitly set to either 'sync' or 'async'.")
+
+        # 2. Re-use Backend Drivers
+        self._sync_client = Client(host=self.api_endpoint)
+        self._async_client = AsyncClient(host=self.api_endpoint)
+        self.client = self._async_client if self.connection_type == "async" else self._sync_client
+
+        # 3. Model Properties
+        self.llm_model = kwargs.get("llm_model", "deepseek-r1:1.5b")
+        self.embed_model = kwargs.get("embed_model", "nomic-embed-text")
+
+        # 4. Context States & Thread Safe Architecture Locks
+        self.initial_context = ""
+        self.running_summary = ""
+        self.chat_history = []
+
+        self.max_active_turns = int(kwargs.get("max_active_turns", 4))
+        if self.max_active_turns < 2:
+            raise ValueError("max_active_turns must be at least 2 to sustain a conversational turn summary block.")
+
+        self.async_lock = asyncio.Lock()
+        self.sync_state_lock = threading.RLock()
+
+        # 5. Local Vector Database Records
+        self.vector_database = []  # Explicit representation: [{"text": str, "vector": np.ndarray, "metadata": dict}]
+        self.db_storage_path = kwargs.get("db_storage_path", "./local_vector_db")
+
+        # BM25 Core Stats
+        self.doc_lens = []
+        self.avg_doc_len = 0.0
+        self.df = {}
+        self.k1 = float(kwargs.get("k1", 1.5))
+        self.b = float(kwargs.get("b", 0.75))
+        self._optimization_layer = MathematicalOptimizationLayer()
+        self.logger = logger
+        self.retrieval_backend = str(kwargs.get("retrieval_backend", "linear")).lower()
+        self._retriever = HybridRetriever(
+            self,
+            backend=self.retrieval_backend,
+        )
+        self.use_orchestrator_for_queries = bool(kwargs.get("use_orchestrator_for_queries", False))
+        self.auto_ensure_ollama = bool(kwargs.get("auto_ensure_ollama", True))
+
+        if self.auto_ensure_ollama:
             try:
-                cls.ensure_ollama_is_running()
+                type(self).ensure_ollama_is_running()
             except Exception as e:
                 raise RuntimeError(f"Failed to bind background Ollama execution loops: {e}") from e
-                
-            cls._instance.is_connected = True
-            cls._instance._api_server_task = None
-            cls._instance.session_manager = None
-            
-        return cls._instance
+        else:
+            logger.info("Skipping Ollama auto-ensure during wrapper init (auto_ensure_ollama=False).")
 
-    @classmethod
-    def reset_singleton(cls):
-        """Allows tearing down the instance cache strictly for isolated testing suites."""
-        cls._instance = None
+        self.is_connected = True
+        self._api_server_task = None
+        self.session_manager = None
+        self._query_orchestrator = self._build_default_orchestrator()
+
+    def close(self, stop_server: bool = False):
+        """Release runtime resources for this wrapper instance."""
+        if stop_server and self._api_server_task is not None:
+            try:
+                asyncio.get_running_loop()
+                logger.warning("close(stop_server=True) called in running loop; scheduling async stop task.")
+                asyncio.create_task(self.stop_api_server())
+            except RuntimeError:
+                asyncio.run(self.stop_api_server())
+
+    @staticmethod
+    def _safe_env_float(name: str, default: float) -> float:
+        value = os.getenv(name)
+        if value in (None, ""):
+            return default
+        try:
+            return float(value)
+        except (TypeError, ValueError):
+            logger.warning(f"Invalid float value for {name}={value!r}; using default {default}.")
+            return default
+
+    @staticmethod
+    def _safe_env_int(name: str, default: int) -> int:
+        value = os.getenv(name)
+        if value in (None, ""):
+            return default
+        try:
+            return int(value)
+        except (TypeError, ValueError):
+            logger.warning(f"Invalid int value for {name}={value!r}; using default {default}.")
+            return default
+
+    @staticmethod
+    def _classify_orchestrator_fallback(exc: Exception) -> tuple[bool, str]:
+        if isinstance(exc, ValueError):
+            return True, "policy-rejection"
+        if isinstance(exc, NotImplementedError):
+            return True, "provider-capability"
+        if isinstance(exc, RuntimeError):
+            return True, "runtime-orchestration"
+        return False, "unexpected"
 
     @classmethod
     def ensure_ollama_is_running(cls):
@@ -254,91 +304,12 @@ class OllamaWrapper:
 
     # --- PART 3: ADVANCED HYBRID LOOKUP & CROSS-ENCODER RERANKING ---
 
-    def _compute_bm25_score(self, query: str, doc_idx: int) -> float:
-        query_terms = query.lower().split()
-        doc_terms = self.vector_database[doc_idx]["text"].lower().split()
-        doc_len = self.doc_lens[doc_idx]
-        
-        score = 0.0
-        N = len(self.vector_database)
-        
-        for term in query_terms:
-            tf = doc_terms.count(term)
-            if tf == 0:
-                continue
-            df_t = self.df.get(term, 0)
-            idf = math.log((N - df_t + 0.5) / (df_t + 0.5) + 1.0)
-            
-            numerator = tf * (self.k1 + 1)
-            denominator = tf + self.k1 * (1 - self.b + self.b * (doc_len / (self.avg_doc_len + 1e-9)))
-            score += idf * (numerator / denominator)
-        return score
-
     def _hybrid_retrieve_and_rerank(self, query: str, top_k: int = 2, metadata_filter: dict = None, sync_mode: bool = True) -> str:
-        if not self.vector_database:
-            return ""
-
-        pool_indices = range(len(self.vector_database))
-        if metadata_filter:
-            pool_indices = [
-                i for i in pool_indices 
-                if all(self.vector_database[i]["metadata"].get(k) == v for k, v in metadata_filter.items())
-            ]
-        if not pool_indices:
-            return ""
-
-        try:
-            # 1. Evaluate Dense Embedding Match Scoring
-            if sync_mode:
-                res = self._sync_client.embed(model=self.embed_model, input=query)
-            else:
-                loop = asyncio.get_running_loop()
-                # Run the coroutine safely within the current event runtime state
-                coro = self._async_client.embed(model=self.embed_model, input=query)
-                res = asyncio.run_coroutine_threadsafe(coro, loop).result()
-
-            q_vec = np.array(res.embeddings[0], dtype=np.float32)
-            q_norm = np.linalg.norm(q_vec)
-            if q_norm > 0: q_vec /= q_norm
-
-            matrix = np.array([self.vector_database[i]["vector"] for i in pool_indices])
-            vector_scores = np.dot(matrix, q_vec)
-
-            # 2. Evaluate Lexical BM25 Score Calculations
-            bm25_scores = np.array([self._compute_bm25_score(query, i) for i in pool_indices], dtype=np.float32)
-
-            # Safeguard against division-by-zero on single-document pools
-            v_min, v_max = vector_scores.min(), vector_scores.max()
-            b_min, b_max = bm25_scores.min(), bm25_scores.max()
-            
-            norm_vector = (vector_scores - v_min) / (v_max - v_min + 1e-9) if v_max > v_min else np.ones_like(vector_scores)
-            norm_bm25 = (bm25_scores - b_min) / (b_max - b_min + 1e-9) if b_max > b_min else np.ones_like(bm25_scores)
-
-            combined_scores = (0.7 * norm_vector) + (0.3 * norm_bm25)
-            
-            candidate_subset_size = min(5, len(pool_indices))
-            top_candidate_indices = np.argsort(combined_scores)[::-1][:candidate_subset_size]
-            candidates = [self.vector_database[pool_indices[idx]] for idx in top_candidate_indices]
-
-            # 3. Stage 2: Cross-Encoder Assessment Pass
-            rerank_manifest = "".join([f"--- CANDIDATE CHUNK ID {i} ---\n{c['text']}\n\n" for i, c in enumerate(candidates)])
-            rerank_prompt = (
-                "You are an AI data reranking module. Grade the candidate text chunks below based on their relevance "
-                f"to the user query: '{query}'. Select the SINGLE most contextually informative chunk ID. "
-                "Output ONLY the selected chunk ID number and nothing else. Do not justify your response.\n\n"
-                f"{rerank_manifest}"
-            )
-
-            response = self._sync_client.generate(model=self.llm_model, prompt=rerank_prompt)
-            raw_decision = self._strip_thinking_tags(response.response)
-            
-            chosen_id = int(''.join(filter(str.isdigit, raw_decision)))
-            if 0 <= chosen_id < len(candidates):
-                return candidates[chosen_id]["text"]
-        except Exception as e:
-            logger.warning(f"Reranking failed: {e}. Falling back to best combined score.")
-            
-        return self.vector_database[pool_indices[0]]["text"]
+        return self._retriever.retrieve_and_rerank(
+            query=query,
+            metadata_filter=metadata_filter,
+            sync_mode=sync_mode,
+        )
 
     # --- PART 4: SYSTEM INQUIRY EXECUTION DRIVERS ---
 
@@ -349,6 +320,42 @@ class OllamaWrapper:
         if extracted_facts:
             instructions += f"### SOURCE DOCUMENTATION CONTEXT\n{extracted_facts}\n\n"
         return instructions + "Answer the user's latest query accurately using the rules and contexts declared above."
+
+    def _base_policy_prompt(self) -> str:
+        instructions = f"### SYSTEM CORE DIRECTIVES\n{self.initial_context}\n\n"
+        if self.running_summary:
+            instructions += f"### CONVERSATION HISTORY FACT SUMMARY\n{self.running_summary}\n\n"
+        return instructions + "Answer the user's latest query accurately using the rules and contexts declared above."
+
+    def _build_default_orchestrator(self) -> DefaultQueryOrchestrator:
+        provider = OllamaProvider(host=self.api_endpoint)
+        return DefaultQueryOrchestrator(
+            providers={"ollama": provider},
+            routing_policy=HeuristicRoutingPolicy(
+                default_provider="ollama",
+                default_model=self.llm_model,
+            ),
+            budget_policy=TokenBudgetPolicy(default_max_input_tokens=1200, default_mode="warn"),
+            guardrails_policy=GovernancePolicy(
+                GovernanceConfig(
+                    allowed_providers={"ollama"},
+                    allowed_models={self.llm_model},
+                    max_payload_chars=12000,
+                )
+            ),
+        )
+
+    def _choose_rate_limiter(self):
+        backend = str(os.getenv("OLLAMA_WRAPPER_RATE_LIMIT_BACKEND", "memory")).lower()
+        default_qps = self._safe_env_float("OLLAMA_WRAPPER_RATE_LIMIT_QPS", 0.0)
+        default_burst = self._safe_env_int("OLLAMA_WRAPPER_RATE_LIMIT_BURST", 0)
+        if backend == "sqlite":
+            db_path = os.getenv("OLLAMA_WRAPPER_RATE_LIMIT_DB", os.path.join(self.db_storage_path, "rate_limit.sqlite3"))
+            db_dir = os.path.dirname(db_path)
+            if db_dir:
+                os.makedirs(db_dir, exist_ok=True)
+            return SQLiteRateLimiter(db_path=db_path, default_qps=default_qps, default_burst=default_burst)
+        return InMemoryRateLimiter(default_qps=default_qps, default_burst=default_burst)
 
     def _fallback_structured_response(self, user_query: str, extracted_facts: str, response_schema: Type[BaseModel]):
         import json, re
@@ -364,6 +371,38 @@ class OllamaWrapper:
     def ask(self, user_query: str, metadata_filter: dict = None, response_schema: Type[BaseModel] = None) -> Any:
         if self.connection_type == "async":
             raise RuntimeError("Cannot execute synchronous ask() call when connection_type is explicitly set to 'async'. Use ask_async().")
+
+        if self.use_orchestrator_for_queries and response_schema is None:
+            try:
+                options = {
+                    "session_turn_count": len(self.chat_history) // 2,
+                }
+                query_response = self._query_orchestrator.run_query(
+                    QueryRequest(
+                        user_query=user_query,
+                        system_prompt=self._base_policy_prompt(),
+                        metadata_filter=metadata_filter or {},
+                        options=options,
+                    )
+                )
+                with self.sync_state_lock:
+                    self.chat_history.append({"role": "user", "content": user_query})
+                    self.chat_history.append({"role": "assistant", "content": self._strip_thinking_tags(query_response.reply)})
+                    self._optimize_and_summarize_history()
+                return query_response.reply
+            except Exception as e:
+                should_fallback, category = self._classify_orchestrator_fallback(e)
+                if not should_fallback:
+                    logger.exception(
+                        "Policy orchestration path failed in ask() with unexpected error; not falling back. category=%s",
+                        category,
+                    )
+                    raise
+                logger.warning(
+                    "Policy orchestration path failed in ask(); falling back to legacy path. category=%s reason=%s",
+                    category,
+                    str(e),
+                )
             
         extracted_facts = self._hybrid_retrieve_and_rerank(user_query, metadata_filter=metadata_filter, sync_mode=True)
         system_instructions = self._assemble_system_instructions(extracted_facts)
@@ -387,15 +426,49 @@ class OllamaWrapper:
             except (ResponseError, RequestError, Exception):
                 model_reply = extracted_facts or f"Echo: {user_query}"
 
-            self.chat_history.append({"role": "user", "content": user_query})
-            self.chat_history.append({"role": "assistant", "content": self._strip_thinking_tags(model_reply)})
-            self._optimize_and_summarize_history()
+            with self.sync_state_lock:
+                self.chat_history.append({"role": "user", "content": user_query})
+                self.chat_history.append({"role": "assistant", "content": self._strip_thinking_tags(model_reply)})
+                self._optimize_and_summarize_history()
             return model_reply
         except (ResponseError, RequestError) as API_Err:
             raise RuntimeError(f"Ollama Endpoint API error occurred: {API_Err}") from API_Err
 
     async def ask_async(self, user_query: str, metadata_filter: dict = None, response_schema: Type[BaseModel] = None) -> Any:
         async with self.async_lock:
+            if self.use_orchestrator_for_queries and response_schema is None:
+                try:
+                    options = {
+                        "session_turn_count": len(self.chat_history) // 2,
+                    }
+                    query_response = await self._query_orchestrator.run_query_async(
+                        QueryRequest(
+                            user_query=user_query,
+                            system_prompt=self._base_policy_prompt(),
+                            metadata_filter=metadata_filter or {},
+                            options=options,
+                        )
+                    )
+                    self.chat_history.append({"role": "user", "content": user_query})
+                    self.chat_history.append(
+                        {"role": "assistant", "content": self._strip_thinking_tags(query_response.reply)}
+                    )
+                    await self._optimize_and_summarize_history_async()
+                    return query_response.reply
+                except Exception as e:
+                    should_fallback, category = self._classify_orchestrator_fallback(e)
+                    if not should_fallback:
+                        logger.exception(
+                            "Policy orchestration path failed in ask_async() with unexpected error; not falling back. category=%s",
+                            category,
+                        )
+                        raise
+                    logger.warning(
+                        "Policy orchestration path failed in ask_async(); falling back to legacy path. category=%s reason=%s",
+                        category,
+                        str(e),
+                    )
+
             extracted_facts = self._hybrid_retrieve_and_rerank(user_query, metadata_filter=metadata_filter, sync_mode=False)
             system_instructions = self._assemble_system_instructions(extracted_facts)
             
@@ -434,7 +507,13 @@ class OllamaWrapper:
         if self._api_server_task is not None and not self._api_server_task.done():
             return
 
-        self.session_manager = ChatSessionManager(self)
+        orchestrator = self._build_default_orchestrator()
+
+        self.session_manager = ChatSessionManager(
+            self,
+            orchestrator=orchestrator,
+            rate_limiter=self._choose_rate_limiter(),
+        )
         app = create_app(self.session_manager)
 
         config = uvicorn.Config(app=app, host=host, port=port, loop="asyncio", log_level="info")

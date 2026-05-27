@@ -8,7 +8,7 @@ OllamaWrapper is a lightweight, single-process RAG (Retrieval-Augmented Generati
 
 ```
 ┌─────────────────────────────────────────────────────────────┐
-│                    OllamaWrapper (Singleton)                │
+│                    OllamaWrapper (Instance)                 │
 ├─────────────────────────────────────────────────────────────┤
 │                                                               │
 │  1. INGESTION LAYER                                         │
@@ -101,6 +101,245 @@ user_query
 - Uses `_hybrid_retrieve_and_rerank_async()` instead (awaitable embedding + rerank)
 - Protected by `asyncio.Lock` to prevent concurrent history mutations
 - Allows multiple queries to run concurrently without blocking
+
+---
+
+## Layered API Flow (Session Endpoints)
+
+For `POST /session/{session_id}/message`, the execution flow is now policy-driven:
+
+```
+Incoming request
+        ↓
+[Rate limiter]
+        ├─ allow → continue
+        └─ reject → HTTP 429
+        ↓
+[Session-aware planner]
+        └─ infers query_type and summary inclusion hints
+        ↓
+[Routing policy]
+        └─ selects provider/model + route_reason
+        ↓
+[Governance guardrails]
+        ├─ allow → continue
+        └─ reject → HTTP 400
+        ↓
+[Budget policy]
+        ├─ warn      → continue
+        ├─ truncate  → continue with adjusted query
+        └─ reject    → HTTP 400
+        ↓
+[Context policy + optimization]
+        └─ diversity-aware selection, query-type calibration, confidence scoring
+        ↓
+[Provider execution]
+        └─ sync/async chat (streaming contract supported)
+        ↓
+[Observability]
+        └─ trace + metrics recording
+        ↓
+Structured response payload
+```
+
+For `POST /session/{session_id}/dry-run`, the same route/planner/guardrails/budget/optimization decisions are computed without invoking provider generation.
+
+---
+
+## API Response Schema Highlights
+
+### Message Response (`POST /session/{session_id}/message`)
+
+Primary fields:
+- `reply`: assistant text
+- `provider`, `model`: selected backend route
+- `usage`: normalized token usage payload (`input_tokens`, `output_tokens`, `total_tokens`, `raw`)
+- `route_reason`: short route reason string
+- `route_explanation`: standardized route details
+    - `provider`
+    - `model`
+    - `reason`
+    - `strategy` (currently `policy-routing-v1`)
+    - `query_type`
+    - `planning_reason`
+- `budget_decision`: budget decision object
+    - `status`, `action`, `reason`
+    - `max_input_tokens`, `max_output_tokens`
+    - `estimated_input_tokens`, `effective_input_tokens`
+- `guardrails`: governance decision object
+    - `status`, `action`, `reason`, `details`
+- `session_plan`: planner output
+    - `query_type`, `session_turn_count`, `include_summary`, `planning_reason`
+
+### Dry-Run Response (`POST /session/{session_id}/dry-run`)
+
+Primary fields:
+- `dry_run`: always `true`
+- `provider`, `model`, `route_reason`, `route_explanation`
+- `session_plan`, `guardrails`, `budget`, `context_plan`
+- `optimization`
+    - `candidate_count`, `selected_count`
+    - `token_estimate`, `token_budget`
+    - `score_weights`, `selected_indices`
+    - `confidence_scores`, `avg_confidence`, `max_confidence`
+
+This structure makes dry-run output directly actionable for routing/cost debugging and release validation.
+
+### Minimal OpenAPI-Style Schemas
+
+```yaml
+openapi: 3.0.3
+paths:
+    /session/{session_id}/message:
+        post:
+            summary: Send a chat message in an existing session
+            responses:
+                "200":
+                    description: Successful assistant response
+                    content:
+                        application/json:
+                            schema:
+                                $ref: "#/components/schemas/MessageResponse"
+                "400":
+                    description: Budget/guardrails rejection
+                    content:
+                        application/json:
+                            schema:
+                                $ref: "#/components/schemas/ErrorResponse"
+                "404":
+                    description: Session not found
+                    content:
+                        application/json:
+                            schema:
+                                $ref: "#/components/schemas/ErrorResponse"
+                "429":
+                    description: Rate limit exceeded
+                    content:
+                        application/json:
+                            schema:
+                                $ref: "#/components/schemas/ErrorResponse"
+
+    /session/{session_id}/dry-run:
+        post:
+            summary: Preview route/policy/optimization decisions without generation
+            responses:
+                "200":
+                    description: Successful dry-run preview
+                    content:
+                        application/json:
+                            schema:
+                                $ref: "#/components/schemas/DryRunResponse"
+                "404":
+                    description: Session not found
+                    content:
+                        application/json:
+                            schema:
+                                $ref: "#/components/schemas/ErrorResponse"
+                "429":
+                    description: Rate limit exceeded
+                    content:
+                        application/json:
+                            schema:
+                                $ref: "#/components/schemas/ErrorResponse"
+
+components:
+    schemas:
+        MessageResponse:
+            type: object
+            required: [reply, provider, model]
+            properties:
+                reply: {type: string}
+                provider: {type: string}
+                model: {type: string}
+                usage:
+                    type: object
+                    properties:
+                        input_tokens: {type: integer, nullable: true}
+                        output_tokens: {type: integer, nullable: true}
+                        total_tokens: {type: integer, nullable: true}
+                        raw: {type: object, additionalProperties: true}
+                route_reason: {type: string}
+                route_explanation:
+                    type: object
+                    properties:
+                        provider: {type: string}
+                        model: {type: string}
+                        reason: {type: string}
+                        strategy: {type: string}
+                        query_type: {type: string}
+                        planning_reason: {type: string}
+                budget_decision: {$ref: "#/components/schemas/BudgetDecision"}
+                guardrails: {$ref: "#/components/schemas/GuardrailsDecision"}
+                session_plan: {$ref: "#/components/schemas/SessionPlan"}
+
+        DryRunResponse:
+            type: object
+            required: [dry_run, provider, model, route_reason]
+            properties:
+                dry_run: {type: boolean, enum: [true]}
+                provider: {type: string}
+                model: {type: string}
+                route_reason: {type: string}
+                route_explanation: {type: object, additionalProperties: true}
+                session_plan: {$ref: "#/components/schemas/SessionPlan"}
+                guardrails: {$ref: "#/components/schemas/GuardrailsDecision"}
+                budget: {$ref: "#/components/schemas/BudgetDecision"}
+                context_plan: {type: object, additionalProperties: true}
+                optimization:
+                    type: object
+                    properties:
+                        candidate_count: {type: integer}
+                        selected_count: {type: integer}
+                        token_estimate: {type: integer}
+                        token_budget: {type: integer}
+                        score_weights: {type: object, additionalProperties: {type: number}}
+                        selected_indices:
+                            type: array
+                            items: {type: integer}
+                        confidence_scores:
+                            type: array
+                            items: {type: number}
+                        avg_confidence: {type: number}
+                        max_confidence: {type: number}
+                options: {type: object, additionalProperties: true}
+
+        BudgetDecision:
+            type: object
+            properties:
+                max_input_tokens: {type: integer, nullable: true}
+                max_output_tokens: {type: integer, nullable: true}
+                mode: {type: string}
+                status: {type: string}
+                action: {type: string}
+                estimated_input_tokens: {type: integer, nullable: true}
+                effective_input_tokens: {type: integer, nullable: true}
+                reason: {type: string}
+
+        GuardrailsDecision:
+            type: object
+            properties:
+                status: {type: string}
+                action: {type: string}
+                reason: {type: string}
+                details: {type: object, additionalProperties: true}
+
+        SessionPlan:
+            type: object
+            properties:
+                query_type: {type: string}
+                session_turn_count: {type: integer}
+                include_summary: {type: boolean}
+                planning_reason: {type: string}
+
+        ErrorResponse:
+            type: object
+            properties:
+                detail:
+                    oneOf:
+                        - type: string
+                        - type: object
+                            additionalProperties: true
+```
 
 ---
 
@@ -213,22 +452,22 @@ Result: messages = [
 
 ---
 
-## Singleton Pattern & State Management
+## Instance Pattern & State Management
 
 ```python
-OllamaWrapper._instance = None
+wrapper1 = OllamaWrapper(connection_type="sync")
+wrapper2 = OllamaWrapper(connection_type="async")
 
-wrapper1 = OllamaWrapper(connection_type="sync")  # Initialize
-wrapper2 = OllamaWrapper(connection_type="async")  # Returns wrapper1 (same object)
+# Independent runtime state per instance
+assert wrapper1 is not wrapper2
 
-# All configuration is set on first instantiation; subsequent calls are no-ops
-wrapper1.vector_database  # Shared across all references
-wrapper1.chat_history     # Shared state
+# Explicit teardown when API task is running
+wrapper1.close(stop_server=True)
 ```
 
 **Trade-off**:
-- ✅ Simple: Users don't manage connection lifecycle
-- ❌ Limited: Can't run multiple independent instances (single-process constraint)
+- ✅ Flexible: Multiple independent instances can run in one process
+- ❌ Lifecycle is explicit: callers should close instances that own background API tasks
 
 ---
 
@@ -342,7 +581,6 @@ Current architecture supports:
 - ✅ Custom BM25 parameters (k1, b)
 
 Would require refactoring:
-- ❌ Multiple independent instances (singleton constraint)
 - ❌ Distributed deployments (no multi-process support)
-- ❌ Streaming responses (all-or-nothing response model)
+- ❌ Full HTTP chunked/SSE stream endpoint at API layer (provider streaming contract exists)
 - ❌ Custom chunking strategies (hardcoded semantic + sliding window)

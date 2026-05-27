@@ -53,6 +53,30 @@ ollama pull nomic-embed-text
 
 ##🚀 Quick Start Guide
 
+## Development Chat Server
+
+Use this script when you want a local chat session API for testing integrations from other libraries/services.
+
+```bash
+python scripts/start_chat_server.py --host 127.0.0.1 --port 8000
+```
+
+For fast integration tests when Ollama is not available, run a local echo backend:
+
+```bash
+python scripts/start_chat_server.py --host 127.0.0.1 --port 8000 --dummy-wrapper
+```
+
+Example API flow after startup:
+
+```bash
+curl -X POST http://127.0.0.1:8000/session -H "Content-Type: application/json" -d '{"system_prompt":"You are helpful."}'
+```
+
+```bash
+curl -X POST http://127.0.0.1:8000/session/<SESSION_ID>/message -H "Content-Type: application/json" -d '{"message":"hello"}'
+```
+
 This single script demonstrates document ingestion with semantic topic-splitting, metadata filtering, a hybrid search query, and a strictly structured Pydantic JSON extraction pass.
 ```
 import asyncio

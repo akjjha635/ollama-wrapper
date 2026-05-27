@@ -5,6 +5,7 @@ import subprocess
 import asyncio
 import threading
 import re
+import shutil
 import numpy as np
 from typing import List, Dict, Any, Type, Optional
 from pydantic import BaseModel
@@ -84,7 +85,19 @@ class OllamaWrapper:
             try:
                 type(self).ensure_ollama_is_running()
             except Exception as e:
-                raise RuntimeError(f"Failed to bind background Ollama execution loops: {e}") from e
+                strict_startup = str(os.getenv("OLLAMA_WRAPPER_STRICT_STARTUP", "false")).lower() in {
+                    "1",
+                    "true",
+                    "yes",
+                    "on",
+                }
+                if strict_startup:
+                    raise RuntimeError(f"Failed to bind background Ollama execution loops: {e}") from e
+                logger.warning(
+                    "Ollama auto-ensure failed during wrapper init; continuing without hard failure "
+                    "(set OLLAMA_WRAPPER_STRICT_STARTUP=true to enforce). reason=%s",
+                    str(e),
+                )
         else:
             logger.info("Skipping Ollama auto-ensure during wrapper init (auto_ensure_ollama=False).")
 
@@ -137,6 +150,10 @@ class OllamaWrapper:
 
     @classmethod
     def ensure_ollama_is_running(cls):
+        if shutil.which("ollama") is None:
+            logger.warning("'ollama' executable not found on PATH; skipping auto-ensure checks.")
+            return
+
         try:
             ollama.list()
         except Exception:
@@ -145,7 +162,14 @@ class OllamaWrapper:
                 subprocess.Popen(["ollama", "serve"], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
                 time.sleep(3)
             except FileNotFoundError:
-                raise RuntimeError("The 'ollama' executable was not found on this system path. Install Ollama before executing.")
+                logger.warning("The 'ollama' executable was not found on PATH after startup attempt; skipping auto-ensure.")
+                return
+
+        try:
+            ollama.list()
+        except Exception as e:
+            logger.warning(f"Ollama endpoint still unreachable after auto-start attempt: {e}")
+            return
         
         try:
             local_models = [m.model for m in ollama.list().models]

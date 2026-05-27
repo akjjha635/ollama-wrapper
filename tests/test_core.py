@@ -2,6 +2,7 @@ import unittest
 import asyncio
 import shutil
 import os
+from unittest.mock import patch
 from pydantic import BaseModel, Field
 from ollama_wrapper.control import SQLiteRateLimiter
 from ollama_wrapper.core import OllamaWrapper
@@ -168,6 +169,32 @@ class TestOllamaWrapperHardening(unittest.TestCase):
         wrapper._query_orchestrator = _ExplodingOrchestrator()
         with self.assertRaises(TypeError):
             wrapper.ask("hello")
+
+    def test_non_strict_startup_does_not_raise_when_auto_ensure_fails(self):
+        prev_strict = os.environ.get("OLLAMA_WRAPPER_STRICT_STARTUP")
+        try:
+            os.environ.pop("OLLAMA_WRAPPER_STRICT_STARTUP", None)
+            with patch.object(OllamaWrapper, "ensure_ollama_is_running", side_effect=RuntimeError("boom")):
+                wrapper = OllamaWrapper(connection_type="sync")
+            self.assertIsInstance(wrapper, OllamaWrapper)
+        finally:
+            if prev_strict is None:
+                os.environ.pop("OLLAMA_WRAPPER_STRICT_STARTUP", None)
+            else:
+                os.environ["OLLAMA_WRAPPER_STRICT_STARTUP"] = prev_strict
+
+    def test_strict_startup_raises_when_auto_ensure_fails(self):
+        prev_strict = os.environ.get("OLLAMA_WRAPPER_STRICT_STARTUP")
+        try:
+            os.environ["OLLAMA_WRAPPER_STRICT_STARTUP"] = "true"
+            with patch.object(OllamaWrapper, "ensure_ollama_is_running", side_effect=RuntimeError("boom")):
+                with self.assertRaises(RuntimeError):
+                    OllamaWrapper(connection_type="sync")
+        finally:
+            if prev_strict is None:
+                os.environ.pop("OLLAMA_WRAPPER_STRICT_STARTUP", None)
+            else:
+                os.environ["OLLAMA_WRAPPER_STRICT_STARTUP"] = prev_strict
 
 class TestOllamaWrapperAsyncConcurrences(unittest.IsolatedAsyncioTestCase):
 
